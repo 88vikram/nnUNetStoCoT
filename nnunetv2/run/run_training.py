@@ -10,6 +10,7 @@ import torch.multiprocessing as mp
 from batchgenerators.utilities.file_and_folder_operations import join, isfile, load_json
 from nnunetv2.paths import nnUNet_preprocessed
 from nnunetv2.run.load_pretrained_weights import load_pretrained_weights
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainerStoCoT import nnUNetTrainerStoCoT
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
@@ -33,19 +34,25 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
                           configuration: str,
                           fold: int,
                           trainer_name: str = 'nnUNetTrainer',
+                          use_stochastic_coteaching: bool = False,
                           plans_identifier: str = 'nnUNetPlans',
                           use_compressed: bool = False,
                           device: torch.device = torch.device('cuda')):
     # load nnunet class and do sanity checks
     nnunet_trainer = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
-                                                trainer_name, 'nnunetv2.training.nnUNetTrainer')
+                                                    trainer_name, 'nnunetv2.training.nnUNetTrainer')
     if nnunet_trainer is None:
         raise RuntimeError(f'Could not find requested nnunet trainer {trainer_name} in '
                            f'nnunetv2.training.nnUNetTrainer ('
                            f'{join(nnunetv2.__path__[0], "training", "nnUNetTrainer")}). If it is located somewhere '
                            f'else, please move it there.')
-    assert issubclass(nnunet_trainer, nnUNetTrainer), 'The requested nnunet trainer class must inherit from ' \
+
+    if use_stochastic_coteaching == False:
+        assert issubclass(nnunet_trainer, nnUNetTrainer), 'The requested nnunet trainer class must inherit from ' \
                                                     'nnUNetTrainer'
+    else:
+        assert issubclass(nnunet_trainer, nnUNetTrainerStoCoT), 'The requested nnunet trainer class must inherit from ' \
+                                                    'nnUNetTrainerStoCoT'
 
     # handle dataset input. If it's an ID we need to convert to int from string
     if dataset_name_or_id.startswith('Dataset'):
@@ -68,7 +75,37 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
     return nnunet_trainer
 
 
-def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool, validation_only: bool,
+def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainerStoCoT, continue_training: bool, validation_only: bool,
+                          pretrained_weights_file: str = None):
+    if continue_training and pretrained_weights_file is not None:
+        raise RuntimeError('Cannot both continue a training AND load pretrained weights. Pretrained weights can only '
+                           'be used at the beginning of the training.')
+    if continue_training:
+        expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_final.pth')
+        if not isfile(expected_checkpoint_file):
+            expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_latest.pth')
+        # special case where --c is used to run a previously aborted validation
+        if not isfile(expected_checkpoint_file):
+            expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_best.pth')
+        if not isfile(expected_checkpoint_file):
+            print(f"WARNING: Cannot continue training because there seems to be no checkpoint available to "
+                               f"continue from. Starting a new training...")
+            expected_checkpoint_file = None
+    elif validation_only:
+        expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_final.pth')
+        if not isfile(expected_checkpoint_file):
+            raise RuntimeError(f"Cannot run validation because the training is not finished yet!")
+    else:
+        if pretrained_weights_file is not None:
+            if not nnunet_trainer.was_initialized:
+                nnunet_trainer.initialize()
+            load_pretrained_weights(nnunet_trainer.network, pretrained_weights_file, verbose=True)
+        expected_checkpoint_file = None
+
+    if expected_checkpoint_file is not None:
+        nnunet_trainer.load_checkpoint(expected_checkpoint_file)
+
+def maybe_load_checkpoint_stocot(nnunet_trainer: nnUNetTrainer, continue_training: bool, validation_only: bool,
                           pretrained_weights_file: str = None):
     if continue_training and pretrained_weights_file is not None:
         raise RuntimeError('Cannot both continue a training AND load pretrained weights. Pretrained weights can only '
@@ -108,12 +145,12 @@ def cleanup_ddp():
     dist.destroy_process_group()
 
 
-def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, use_compressed, disable_checkpointing, c, val,
+def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, use_stochastic_coteaching, p, use_compressed, disable_checkpointing, c, val,
             pretrained_weights, npz, val_with_best, world_size):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
-    nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p,
+    nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, use_stochastic_coteaching, p,
                                            use_compressed)
 
     if disable_checkpointing:
@@ -121,7 +158,10 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, use_compressed
 
     assert not (c and val), f'Cannot set --c and --val flag at the same time. Dummy.'
 
-    maybe_load_checkpoint(nnunet_trainer, c, val, pretrained_weights)
+    if use_stochastic_coteaching ==False:
+        maybe_load_checkpoint(nnunet_trainer, c, val, pretrained_weights)
+    else:
+        maybe_load_checkpoint_stocot(nnunet_trainer, c, val, pretrained_weights)
 
     if torch.cuda.is_available():
         cudnn.deterministic = False
@@ -139,6 +179,7 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, use_compressed
 def run_training(dataset_name_or_id: Union[str, int],
                  configuration: str, fold: Union[int, str],
                  trainer_class_name: str = 'nnUNetTrainer',
+                 use_stochastic_coteaching: bool = False,
                  plans_identifier: str = 'nnUNetPlans',
                  pretrained_weights: Optional[str] = None,
                  num_gpus: int = 1,
@@ -181,6 +222,7 @@ def run_training(dataset_name_or_id: Union[str, int],
                      configuration,
                      fold,
                      trainer_class_name,
+                     use_stochastic_coteaching,
                      plans_identifier,
                      use_compressed_data,
                      disable_checkpointing,
@@ -193,7 +235,7 @@ def run_training(dataset_name_or_id: Union[str, int],
                  nprocs=num_gpus,
                  join=True)
     else:
-        nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, trainer_class_name,
+        nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold,  trainer_class_name, use_stochastic_coteaching,
                                                plans_identifier, use_compressed_data, device=device)
 
         if disable_checkpointing:
@@ -201,7 +243,10 @@ def run_training(dataset_name_or_id: Union[str, int],
 
         assert not (continue_training and only_run_validation), f'Cannot set --c and --val flag at the same time. Dummy.'
 
-        maybe_load_checkpoint(nnunet_trainer, continue_training, only_run_validation, pretrained_weights)
+        if use_stochastic_coteaching == False:
+            maybe_load_checkpoint(nnunet_trainer, continue_training, only_run_validation, pretrained_weights)
+        else:
+            maybe_load_checkpoint_stocot(nnunet_trainer, continue_training, only_run_validation, pretrained_weights)
 
         if torch.cuda.is_available():
             cudnn.deterministic = False
@@ -226,6 +271,8 @@ def run_training_entry():
                         help='Fold of the 5-fold cross-validation. Should be an int between 0 and 4.')
     parser.add_argument('-tr', type=str, required=False, default='nnUNetTrainer',
                         help='[OPTIONAL] Use this flag to specify a custom trainer. Default: nnUNetTrainer')
+    parser.add_argument('-stocot', type=bool, required=False, default=False,
+                        help='[OPTIONAL] Use this flag to specify if you want to use stochastic co-training to account for noisy labels. This has to be accompanied by -tr nnUNetTrainerStoCoT Default: 0')
     parser.add_argument('-p', type=str, required=False, default='nnUNetPlans',
                         help='[OPTIONAL] Use this flag to specify a custom plans identifier. Default: nnUNetPlans')
     parser.add_argument('-pretrained_weights', type=str, required=False, default=None,
@@ -272,7 +319,7 @@ def run_training_entry():
     else:
         device = torch.device('mps')
 
-    run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
+    run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr,args.stocot, args.p, args.pretrained_weights,
                  args.num_gpus, args.use_compressed, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
                  device=device)
 
