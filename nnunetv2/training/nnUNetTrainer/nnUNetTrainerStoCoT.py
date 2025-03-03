@@ -54,10 +54,10 @@ from nnunetv2.training.dataloading.data_loader_2d import nnUNetDataLoader2D
 from nnunetv2.training.dataloading.data_loader_3d import nnUNetDataLoader3D
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
 from nnunetv2.training.dataloading.utils import get_case_identifiers, unpack_dataset
-from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
-from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_StoCoT_loss
-from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
-from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
+from nnunetv2.training.logging.nnunet_logger import nnUNetLoggerStoCoT
+from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_CE_StoCoT_loss
+from nnunetv2.training.loss.deep_supervision import StoCoTDeepSupervisionWrapper
+from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss, StoCoTSoftDiceLoss
 from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
 from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.utilities.crossval_split import generate_crossval_split
@@ -149,7 +149,7 @@ class nnUNetTrainerStoCoT(object):
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 2
+        self.num_epochs = 50
         self.current_epoch = 0
         self.enable_deep_supervision = True
 
@@ -162,8 +162,11 @@ class nnUNetTrainerStoCoT(object):
         self.network1 = None  # -> self.build_network_architecture()
         self.network2 = None  # -> self.build_network_architecture()
 
-        self.optimizer = self.lr_scheduler = None  # -> self.initialize
-        self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        self.optimizer1 = self.lr_scheduler1 = None  # -> self.initialize
+        self.optimizer2 = self.lr_scheduler2 = None
+        self.grad_scaler1 = GradScaler() if self.device.type == 'cuda' else None
+        self.grad_scaler2 = GradScaler() if self.device.type == 'cuda' else None
+
         self.loss = None  # -> self.initialize
 
         ### Simple logging. Don't take that away from me!
@@ -174,7 +177,7 @@ class nnUNetTrainerStoCoT(object):
         self.log_file = join(self.output_folder, "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %
                              (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute,
                               timestamp.second))
-        self.logger = nnUNetLogger()
+        self.logger = nnUNetLoggerStoCoT()
 
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
@@ -231,7 +234,8 @@ class nnUNetTrainerStoCoT(object):
                 self.network1 = torch.compile(self.network1)
                 self.network2 = torch.compile(self.network2)
 
-            self.optimizer, self.lr_scheduler = self.configure_optimizers()
+            self.optimizer1, self.optimizer2, self.lr_scheduler1, self.lr_scheduler2 = self.configure_optimizers()
+
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
                 self.network1 = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network1)
@@ -402,22 +406,23 @@ class nnUNetTrainerStoCoT(object):
 
     def _build_loss(self):
         if self.label_manager.has_regions:
+            #StoCoT loss not integrated here yet
+            #TODO: StoCoT loss here
             loss = DC_and_BCE_loss({},
                                    {'batch_dice': self.configuration_manager.batch_dice,
                                     'do_bg': True, 'smooth': 1e-5, 'ddp': self.is_ddp},
                                    use_ignore_label=self.label_manager.ignore_label is not None,
                                    dice_class=MemoryEfficientSoftDiceLoss)
         else:
-            loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
+            loss = DC_and_CE_StoCoT_loss({'batch_dice': self.configuration_manager.batch_dice,
                                    'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
-                                  ignore_label=self.label_manager.ignore_label, dice_class=MemoryEfficientSoftDiceLoss)
+                                  ignore_label=self.label_manager.ignore_label, dice_class=StoCoTSoftDiceLoss)
 
         if self._do_i_compile():
             loss.dc = torch.compile(loss.dc)
 
         # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
         # this gives higher resolution outputs more weight in the loss
-
         if self.enable_deep_supervision:
             deep_supervision_scales = self._get_deep_supervision_scales()
             weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
@@ -432,7 +437,7 @@ class nnUNetTrainerStoCoT(object):
             # we don't use the lowest 2 outputs. Normalize weights so that they sum to 1
             weights = weights / weights.sum()
             # now wrap the loss
-            loss = DeepSupervisionWrapper(loss, weights)
+            loss = StoCoTDeepSupervisionWrapper(loss, weights)
 
         return loss
 
@@ -517,12 +522,14 @@ class nnUNetTrainerStoCoT(object):
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.SGD(self.network1.parameters(), self.initial_lr, weight_decay=self.weight_decay,
+        optimizer1 = torch.optim.SGD(self.network1.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
-        optimizer = torch.optim.SGD(self.network2.parameters(), self.initial_lr, weight_decay=self.weight_decay,
+        optimizer2 = torch.optim.SGD(self.network2.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
-        lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
-        return optimizer, lr_scheduler
+        lr_scheduler1 = PolyLRScheduler(optimizer1, self.initial_lr, self.num_epochs)
+        lr_scheduler2 = PolyLRScheduler(optimizer2, self.initial_lr, self.num_epochs)
+
+        return optimizer1, optimizer2, lr_scheduler1, lr_scheduler2
 
     def plot_network_architecture(self):
         if self._do_i_compile():
@@ -986,13 +993,14 @@ class nnUNetTrainerStoCoT(object):
     def on_train_epoch_start(self):
         self.network1.train()
         self.network2.train()
-        self.lr_scheduler.step(self.current_epoch)
+        self.lr_scheduler1.step(self.current_epoch)
+        self.lr_scheduler2.step(self.current_epoch)
         self.print_to_log_file('')
         self.print_to_log_file(f'Epoch {self.current_epoch}')
         self.print_to_log_file(
-            f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=5)}")
+            f"Current learning rate: {np.round(self.optimizer1.param_groups[0]['lr'], decimals=5)}")
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
-        self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
+        self.logger.log('lrs', self.optimizer1.param_groups[0]['lr'], self.current_epoch)
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
@@ -1004,7 +1012,9 @@ class nnUNetTrainerStoCoT(object):
         else:
             target = target.to(self.device, non_blocking=True)
 
-        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer1.zero_grad(set_to_none=True)
+        self.optimizer2.zero_grad(set_to_none=True)
+
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
@@ -1013,38 +1023,49 @@ class nnUNetTrainerStoCoT(object):
             output1 = self.network1(data)
             output2 = self.network2(data)
             # del data
-            l = self.loss(output1, target)
-            l2 = self.loss(output2, target)
+            l,l2 = self.loss(output1, output2, target)
 
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(l).backward()
-            self.grad_scaler.scale(l2).backward()
-            self.grad_scaler.unscale_(self.optimizer)
+        if self.grad_scaler1 is not None:
+            self.grad_scaler1.scale(l).backward()
+            self.grad_scaler1.unscale_(self.optimizer1)
             torch.nn.utils.clip_grad_norm_(self.network1.parameters(), 12)
-            torch.nn.utils.clip_grad_norm_(self.network2.parameters(), 12)
+            self.grad_scaler1.step(self.optimizer1)
+            self.grad_scaler1.update()
 
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
+            self.grad_scaler2.scale(l2).backward()
+            self.grad_scaler2.unscale_(self.optimizer2)
+            torch.nn.utils.clip_grad_norm_(self.network2.parameters(), 12)
+            self.grad_scaler2.step(self.optimizer2)
+            self.grad_scaler2.update()
         else:
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network1.parameters(), 12)
             l2.backward()
             torch.nn.utils.clip_grad_norm_(self.network2.parameters(), 12)
 
-            self.optimizer.step()
-        return {'loss': l.detach().cpu().numpy()}
+            self.optimizer1.step()
+            self.optimizer2.step()
+
+        return {'loss1': l.detach().cpu().numpy(), 'loss2': l2.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
 
         if self.is_ddp:
             losses_tr = [None for _ in range(dist.get_world_size())]
-            dist.all_gather_object(losses_tr, outputs['loss'])
+            dist.all_gather_object(losses_tr, outputs['loss1'])
             loss_here = np.vstack(losses_tr).mean()
-        else:
-            loss_here = np.mean(outputs['loss'])
 
-        self.logger.log('train_losses', loss_here, self.current_epoch)
+            losses_tr2 = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(losses_tr2, outputs['loss2'])
+            loss_here2 = np.vstack(losses_tr2).mean()
+        else:
+            loss_here = np.mean(outputs['loss1'])
+            loss_here2 = np.mean(outputs['loss2'])
+
+        self.logger.log('train_losses1', loss_here, self.current_epoch)
+        self.logger.log('train_losses2', loss_here, self.current_epoch)
+
 
     def on_validation_epoch_start(self):
         self.network1.eval()
@@ -1065,27 +1086,34 @@ class nnUNetTrainerStoCoT(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network1(data)
-            output = self.network2(data)
+            output1 = self.network1(data)
+            output2 = self.network2(data)
             del data
-            l = self.loss(output, target)
+            l, l2 = self.loss(output1, output2, target)
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
-            output = output[0]
+            output1 = output1[0]
+            output2 = output2[0]
             target = target[0]
 
         # the following is needed for online evaluation. Fake dice (green line)
-        axes = [0] + list(range(2, output.ndim))
+        axes = [0] + list(range(2, output1.ndim))
 
         if self.label_manager.has_regions:
-            predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
+            predicted_segmentation_onehot1 = (torch.sigmoid(output1) > 0.5).long()
+            predicted_segmentation_onehot2 = (torch.sigmoid(output2) > 0.5).long()
         else:
             # no need for softmax
-            output_seg = output.argmax(1)[:, None]
-            predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
-            predicted_segmentation_onehot.scatter_(1, output_seg, 1)
-            del output_seg
+            output_seg1 = output1.argmax(1)[:, None]
+            output_seg2 = output2.argmax(1)[:, None]
+
+            predicted_segmentation_onehot1 = torch.zeros(output1.shape, device=output1.device, dtype=torch.float32)
+            predicted_segmentation_onehot1.scatter_(1, output_seg1, 1)
+
+            predicted_segmentation_onehot2 = torch.zeros(output2.shape, device=output2.device, dtype=torch.float32)
+            predicted_segmentation_onehot2.scatter_(1, output_seg2, 1)
+            del output_seg1, output_seg2
 
         if self.label_manager.has_ignore_label:
             if not self.label_manager.has_regions:
@@ -1102,11 +1130,17 @@ class nnUNetTrainerStoCoT(object):
         else:
             mask = None
 
-        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
+        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot1, target, axes=axes, mask=mask)
+        tp2, fp2, fn2, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot2, target, axes=axes, mask=mask)
 
         tp_hard = tp.detach().cpu().numpy()
         fp_hard = fp.detach().cpu().numpy()
         fn_hard = fn.detach().cpu().numpy()
+
+        tp2_hard = tp2.detach().cpu().numpy()
+        fp2_hard = fp2.detach().cpu().numpy()
+        fn2_hard = fn2.detach().cpu().numpy()
+
         if not self.label_manager.has_regions:
             # if we train with regions all segmentation heads predict some kind of foreground. In conventional
             # (softmax training) there needs tobe one output for the background. We are not interested in the
@@ -1115,14 +1149,23 @@ class nnUNetTrainerStoCoT(object):
             tp_hard = tp_hard[1:]
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
+            
+            tp2_hard = tp2_hard[1:]
+            fp2_hard = fp2_hard[1:]
+            fn2_hard = fn2_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        return {'loss1': l.detach().cpu().numpy(), 'tp1_hard': tp_hard, 'fp1_hard': fp_hard, 'fn1_hard': fn_hard,
+                'loss2': l2.detach().cpu().numpy(), 'tp2_hard': tp2_hard, 'fp2_hard': fp2_hard, 'fn2_hard': fn2_hard}
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
-        tp = np.sum(outputs_collated['tp_hard'], 0)
-        fp = np.sum(outputs_collated['fp_hard'], 0)
-        fn = np.sum(outputs_collated['fn_hard'], 0)
+        tp = np.sum(outputs_collated['tp1_hard'], 0)
+        fp = np.sum(outputs_collated['fp1_hard'], 0)
+        fn = np.sum(outputs_collated['fn1_hard'], 0)
+
+        tp2 = np.sum(outputs_collated['tp2_hard'], 0)
+        fp2 = np.sum(outputs_collated['fp2_hard'], 0)
+        fn2 = np.sum(outputs_collated['fn2_hard'], 0)
 
         if self.is_ddp:
             world_size = dist.get_world_size()
@@ -1131,25 +1174,48 @@ class nnUNetTrainerStoCoT(object):
             dist.all_gather_object(tps, tp)
             tp = np.vstack([i[None] for i in tps]).sum(0)
 
+            tps = [None for _ in range(world_size)]
+            dist.all_gather_object(tps, tp2)
+            tp2 = np.vstack([i[None] for i in tps]).sum(0)
+
             fps = [None for _ in range(world_size)]
             dist.all_gather_object(fps, fp)
             fp = np.vstack([i[None] for i in fps]).sum(0)
+
+            fps = [None for _ in range(world_size)]
+            dist.all_gather_object(fps, fp2)
+            fp2 = np.vstack([i[None] for i in fps]).sum(0)
 
             fns = [None for _ in range(world_size)]
             dist.all_gather_object(fns, fn)
             fn = np.vstack([i[None] for i in fns]).sum(0)
 
+            fns = [None for _ in range(world_size)]
+            dist.all_gather_object(fns, fn2)
+            fn2 = np.vstack([i[None] for i in fns]).sum(0)
+
             losses_val = [None for _ in range(world_size)]
-            dist.all_gather_object(losses_val, outputs_collated['loss'])
-            loss_here = np.vstack(losses_val).mean()
+            dist.all_gather_object(losses_val, outputs_collated['loss1'])
+            loss1_here = np.vstack(losses_val).mean()
+
+            losses_val = [None for _ in range(world_size)]
+            dist.all_gather_object(losses_val, outputs_collated['loss2'])
+            loss2_here = np.vstack(losses_val).mean()
         else:
-            loss_here = np.mean(outputs_collated['loss'])
+            loss1_here = np.mean(outputs_collated['loss1'])
+            loss2_here = np.mean(outputs_collated['loss2'])
 
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
+        global_dc_per_class2 = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp2, fp2, fn2)]]
         mean_fg_dice = np.nanmean(global_dc_per_class)
-        self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
-        self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
-        self.logger.log('val_losses', loss_here, self.current_epoch)
+        mean_fg_dice2 = np.nanmean(global_dc_per_class2)
+        self.logger.log('mean_fg_dice1', mean_fg_dice, self.current_epoch)
+        self.logger.log('mean_fg_dice2', mean_fg_dice2, self.current_epoch)
+        self.logger.log('dice_per_class_or_region1', global_dc_per_class, self.current_epoch)
+        self.logger.log('dice_per_class_or_region2', global_dc_per_class2, self.current_epoch)
+        self.logger.log('val_losses1', loss1_here, self.current_epoch)
+        self.logger.log('val_losses2', loss2_here, self.current_epoch)
+
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
@@ -1157,10 +1223,14 @@ class nnUNetTrainerStoCoT(object):
     def on_epoch_end(self):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
-        self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
-        self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
-        self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
-                                               self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
+        self.print_to_log_file('train_loss1', np.round(self.logger.my_fantastic_logging['train_losses1'][-1], decimals=4))
+        self.print_to_log_file('val_loss1', np.round(self.logger.my_fantastic_logging['val_losses1'][-1], decimals=4))
+        self.print_to_log_file('train_loss2', np.round(self.logger.my_fantastic_logging['train_losses2'][-1], decimals=4))
+        self.print_to_log_file('val_loss2', np.round(self.logger.my_fantastic_logging['val_losses2'][-1], decimals=4))
+        self.print_to_log_file('Pseudo dice (network1)', [np.round(i, decimals=4) for i in
+                                               self.logger.my_fantastic_logging['dice_per_class_or_region1'][-1]])
+        self.print_to_log_file('Pseudo dice (network2)', [np.round(i, decimals=4) for i in
+                                               self.logger.my_fantastic_logging['dice_per_class_or_region2'][-1]])
         self.print_to_log_file(
             f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
 
@@ -1170,8 +1240,11 @@ class nnUNetTrainerStoCoT(object):
             self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
 
         # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
-        if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
-            self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
+        if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice1'][-1] > self._best_ema or self.logger.my_fantastic_logging['ema_fg_dice2'][-1] > self._best_ema:
+            if self.logger.my_fantastic_logging['ema_fg_dice1'][-1] > self.logger.my_fantastic_logging['ema_fg_dice2'][-1]:
+                self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice1'][-1]
+            else:
+                self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice2'][-1]
             self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
             self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
 
@@ -1198,8 +1271,10 @@ class nnUNetTrainerStoCoT(object):
                 checkpoint = {
                     'network1_weights': mod1.state_dict(),
                     'network2_weights': mod2.state_dict(),
-                    'optimizer_state': self.optimizer.state_dict(),
-                    'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
+                    'optimizer_state1': self.optimizer1.state_dict(),
+                    'optimizer_state2': self.optimizer2.state_dict(),
+                    'grad_scaler_state1': self.grad_scaler1.state_dict() if self.grad_scaler1 is not None else None,
+                    'grad_scaler_state2': self.grad_scaler2.state_dict() if self.grad_scaler2 is not None else None,
                     'logging': self.logger.get_checkpoint(),
                     '_best_ema': self._best_ema,
                     'current_epoch': self.current_epoch + 1,
@@ -1256,10 +1331,14 @@ class nnUNetTrainerStoCoT(object):
             else:
                 self.network2.load_state_dict(new_state_dict)
 
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        if self.grad_scaler is not None:
-            if checkpoint['grad_scaler_state'] is not None:
-                self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
+        self.optimizer1.load_state_dict(checkpoint['optimizer_state1'])
+        self.optimizer2.load_state_dict(checkpoint['optimizer_state2'])
+
+        if self.grad_scaler1 is not None:
+            if checkpoint['grad_scaler_state1'] is not None:
+                self.grad_scaler1.load_state_dict(checkpoint['grad_scaler_state1'])
+                self.grad_scaler2.load_state_dict(checkpoint['grad_scaler_state2'])
+
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         self.set_deep_supervision_enabled(False)

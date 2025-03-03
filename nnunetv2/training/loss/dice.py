@@ -21,7 +21,6 @@ class SoftDiceLoss(nn.Module):
 
     def forward(self, x, y, loss_mask=None):
         shp_x = x.shape
-
         if self.batch_dice:
             axes = [0] + list(range(2, len(shp_x)))
         else:
@@ -53,6 +52,70 @@ class SoftDiceLoss(nn.Module):
         dc = dc.mean()
 
         return -dc
+
+class StoCoTSoftDiceLoss(nn.Module):
+    def __init__(self, apply_nonlin: Callable = None, batch_dice: bool = False, do_bg: bool = True, smooth: float = 1.,
+                 ddp: bool = True, clip_tp: float = None):
+        """
+        """
+        super(StoCoTSoftDiceLoss, self).__init__()
+
+        self.do_bg = do_bg
+        self.batch_dice = batch_dice
+        self.apply_nonlin = apply_nonlin
+        self.smooth = smooth
+        self.clip_tp = clip_tp
+        self.ddp = ddp
+
+    def forward(self, x1, x2, y, loss_mask=None):
+        shp_x = x1.shape
+        if self.batch_dice:
+            axes = [0] + list(range(2, len(shp_x)))
+        else:
+            axes = list(range(2, len(shp_x)))
+
+        if self.apply_nonlin is not None:
+            x1 = self.apply_nonlin(x1)
+            x2 = self.apply_nonlin(x2)
+
+        # TODO: loss_mask as a way to implement stochastic co-teaching
+        tp, fp, fn, _ = get_tp_fp_fn_tn(x1, y, axes, loss_mask, False)
+        tp2, fp2, fn2, _ = get_tp_fp_fn_tn(x2, y, axes, loss_mask, False)
+
+        if self.ddp and self.batch_dice:
+            tp = AllGatherGrad.apply(tp).sum(0)
+            fp = AllGatherGrad.apply(fp).sum(0)
+            fn = AllGatherGrad.apply(fn).sum(0)
+            
+            tp2 = AllGatherGrad.apply(tp2).sum(0)
+            fp2 = AllGatherGrad.apply(fp2).sum(0)
+            fn2 = AllGatherGrad.apply(fn2).sum(0)
+
+        if self.clip_tp is not None:
+            tp = torch.clip(tp, min=self.clip_tp , max=None)
+            tp2 = torch.clip(tp2, min=self.clip_tp , max=None)
+
+
+        nominator = 2 * tp
+        denominator = 2 * tp + fp + fn
+        dc = (nominator + self.smooth) / (torch.clip(denominator + self.smooth, 1e-8))
+
+        nominator = 2 * tp2
+        denominator = 2 * tp2 + fp2 + fn2
+        dc2 = (nominator + self.smooth) / (torch.clip(denominator + self.smooth, 1e-8))
+
+        if not self.do_bg:
+            if self.batch_dice:
+                dc = dc[1:]
+                dc2 = dc2[1:]
+            else:
+                dc = dc[:, 1:]
+                dc2 = dc2[:, 1:]
+        
+        dc = dc.mean()
+        dc2 = dc2.mean()
+
+        return -dc, -dc2
 
 
 class MemoryEfficientSoftDiceLoss(nn.Module):
@@ -114,7 +177,6 @@ class MemoryEfficientSoftDiceLoss(nn.Module):
             sum_gt = sum_gt.sum(0)
 
         dc = (2 * intersect + self.smooth) / (torch.clip(sum_gt + sum_pred + self.smooth, 1e-8))
-
         dc = dc.mean()
         return -dc
 
