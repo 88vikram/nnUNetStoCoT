@@ -3,6 +3,7 @@ import os
 from copy import deepcopy
 from multiprocessing import Pool
 from typing import Tuple, List, Union, Optional
+import re 
 
 import numpy as np
 from batchgenerators.utilities.file_and_folder_operations import subfiles, join, save_json, load_json, \
@@ -133,11 +134,14 @@ def compute_metrics_on_folder(folder_ref: str, folder_pred: str, output_file: st
         assert output_file.endswith('.json'), 'output_file should end with .json'
     files_pred = subfiles(folder_pred, suffix=file_ending, join=False)
     files_ref = subfiles(folder_ref, suffix=file_ending, join=False)
+
     if not chill:
         present = [isfile(join(folder_pred, i)) for i in files_ref]
         assert all(present), "Not all files in folder_ref exist in folder_pred"
-    files_ref = [join(folder_ref, i) for i in files_pred]
+    #files_ref = [join(folder_ref, i) for i in files_pred]
+    files_ref = [join(folder_ref, re.sub(r'(_network1|_network2)', '', i)) for i in files_pred]
     files_pred = [join(folder_pred, i) for i in files_pred]
+
     with multiprocessing.get_context("spawn").Pool(num_processes) as pool:
         # for i in list(zip(files_ref, files_pred, [image_reader_writer] * len(files_pred), [regions_or_labels] * len(files_pred), [ignore_label] * len(files_pred))):
         #     compute_metrics(*i)

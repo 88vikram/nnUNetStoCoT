@@ -1,8 +1,9 @@
 import torch
 from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLoss, StoCoTSoftDiceLoss
-from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLoss
+from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLoss, StoCoTRobustCrossEntropyLoss
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 from torch import nn
+import numpy as np
 
 
 class DC_and_CE_loss(nn.Module):
@@ -59,7 +60,7 @@ class DC_and_CE_loss(nn.Module):
     
 class DC_and_CE_StoCoT_loss(nn.Module):
     def __init__(self, soft_dice_kwargs, ce_kwargs, weight_ce=1, weight_dice=1, ignore_label=None,
-                 dice_class=StoCoTSoftDiceLoss):
+                 dice_class=StoCoTSoftDiceLoss,alpha=32,beta=2):
         """
         Weights for CE and Dice do not need to sum to one. You can set whatever you want.
         :param soft_dice_kwargs:
@@ -76,17 +77,36 @@ class DC_and_CE_StoCoT_loss(nn.Module):
         self.weight_dice = weight_dice
         self.weight_ce = weight_ce
         self.ignore_label = ignore_label
-        self.ce = RobustCrossEntropyLoss(**ce_kwargs)
+        self.ce = StoCoTRobustCrossEntropyLoss(**ce_kwargs)
         self.dc = dice_class(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
+        self.alpha = alpha
+        self.beta = beta
+        self.rng=np.random.Generator(np.random.PCG64(808))
 
-    def forward(self, net_output1: torch.Tensor,net_output2: torch.Tensor, target: torch.Tensor):
+
+
+    def generate_stochastic_thresholds(self,x,alpha,beta,learning_rate):
+
+        samples=x.shape[0]
+        if len(x.shape)==4:
+            dist_shape=(samples,16,16)
+        elif len(x.shape)==5:
+            dist_shape = (samples,8,16,16)
+        
+        if learning_rate != 0:
+            stochastic_thresholds = torch.from_numpy(
+                learning_rate * self.rng.beta(a=alpha, b=beta, size=dist_shape).astype(np.float32)).cuda()
+        
+        return stochastic_thresholds
+        # generate thresholds based on beta pdf.
+
+    def forward(self, net_output1: torch.Tensor,net_output2: torch.Tensor, target: torch.Tensor, learning_rate: float):
         """
         target must be b, c, x, y(, z) with c=1
         :param net_output:
         :param target:
         :return:
         """
-
         if self.ignore_label is not None:
             assert target.shape[1] == 1, 'ignore label is not implemented for one hot encoded target variables ' \
                                          '(DC_and_CE_loss)'
@@ -99,14 +119,25 @@ class DC_and_CE_StoCoT_loss(nn.Module):
             target_dice = target
             mask = None
 
+        stochastic_thresholds = self.generate_stochastic_thresholds(net_output1,self.alpha,self.beta,learning_rate)
+
         if self.weight_dice != 0:
-            dc_loss1, dc_loss2 = self.dc(net_output1, net_output2, target_dice, loss_mask=mask)
+            dc_loss1, dc_loss2 = self.dc(net_output1, net_output2, target_dice,stochastic_thresholds,loss_mask=mask)
+        else:
+            dc_loss1=0
+            dc_loss2=0
+
+        if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0):
+            ce_loss1, ce_loss2 = self.ce(net_output1, net_output2, target[:, 0],stochastic_thresholds)
+        else:
+            ce_loss1 = 0
+            ce_loss2 = 0 
+
+        #ce_loss1 = self.ce(net_output1, target[:, 0]) \
+        #    if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
         
-        ce_loss1 = self.ce(net_output1, target[:, 0]) \
-            if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
-        
-        ce_loss2 = self.ce(net_output2, target[:, 0]) \
-            if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
+        #ce_loss2 = self.ce(net_output2, target[:, 0]) \
+        #    if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
 
         result1 = self.weight_ce * ce_loss1 + self.weight_dice * dc_loss1
         result2 = self.weight_ce * ce_loss2 + self.weight_dice * dc_loss2

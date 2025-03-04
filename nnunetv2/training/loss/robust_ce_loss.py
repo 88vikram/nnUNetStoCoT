@@ -13,7 +13,75 @@ class RobustCrossEntropyLoss(nn.CrossEntropyLoss):
         if target.ndim == input.ndim:
             assert target.shape[1] == 1
             target = target[:, 0]
+        
         return super().forward(input, target.long())
+    
+
+class StoCoTRobustCrossEntropyLoss(nn.CrossEntropyLoss):
+    """
+    this is just a compatibility layer because my target tensor is float and has an extra dimension
+
+    input must be logits, not probabilities!
+    """
+       
+    def repeat_and_truncate(self,tensor, target_shape, missing_dim=None):
+        
+        if missing_dim is not None:
+            tensor = tensor.unsqueeze(missing_dim)
+
+        device = tensor.device  # Ensure we operate on the correct device
+        # Calculate repeat_factors
+        repeat_factors = []
+        for i, current_dim in enumerate(tensor.shape):
+            # Calculate how many times the tensor needs to be repeated in each dimension
+            repeat_factor = target_shape[i] // current_dim
+            if target_shape[i] % current_dim != 0:
+                repeat_factor += 1  # Ensure full coverage by repeating one extra time if needed
+            repeat_factors.append(repeat_factor)
+        
+        repeated_tensor_full = tensor.repeat(*repeat_factors).to(device)
+
+        # Slice (truncate) if repeated tensor exceeds target shape
+        slices = tuple(slice(0, min(repeated_tensor_full.shape[i], target_shape[i])) for i in range(len(target_shape)))
+        final_repeated_tensor=repeated_tensor_full[slices].to(device)
+
+        return final_repeated_tensor
+
+    def mask_probabilities(self,x,final_stochastic_thresholds):        
+
+        mask = torch.ones((1,), dtype=torch.float32, device=x.device).expand(tuple(x.shape))
+        mask = torch.gt(x, final_stochastic_thresholds).type(torch.cuda.FloatTensor)
+        
+        return mask
+
+    def forward(self, input1: Tensor,input2: Tensor, target: Tensor,stochastic_thresholds:Tensor):
+        if target.ndim == input1.ndim:
+            assert target.shape[1] == 1
+            target = target[:, 0]
+
+        final_stochastic_thresholds=self.repeat_and_truncate(stochastic_thresholds,input1.shape,1)
+        stocot_mask1 = self.mask_probabilities(input1,final_stochastic_thresholds).to(torch.bool)
+        stocot_mask2 = self.mask_probabilities(input2,final_stochastic_thresholds).to(torch.bool)
+
+        loss_object=nn.CrossEntropyLoss(reduction='none')
+
+        if input1.ndim != target.ndim:
+            target = target.view((target.shape[0], 1, *target.shape[1:]))
+
+        if input1.shape == target.shape:
+            # if this is the case then gt is probably already a one hot encoding
+            y_onehot = target
+        else:
+            y_onehot = torch.zeros(input1.shape, device=input1.device, dtype=torch.bool)
+            y_onehot.scatter_(1, target.long(), 1)
+
+        loss1=loss_object.forward(input1[stocot_mask2], y_onehot[stocot_mask2].float())
+        loss2=loss_object.forward(input2[stocot_mask1], y_onehot[stocot_mask1].float())
+
+        ce_loss1=loss1.sum() / stocot_mask2.sum()
+        ce_loss2=loss2.sum() / stocot_mask1.sum()
+
+        return ce_loss1,ce_loss2
 
 
 class TopKLoss(RobustCrossEntropyLoss):

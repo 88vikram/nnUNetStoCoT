@@ -94,6 +94,10 @@ class nnUNetTrainerStoCoT(object):
 
         self.device = device
 
+        # parameters of the beta distribution
+        self.alpha=32 # default values
+        self.beta=2
+
         # print what device we are using
         if self.is_ddp:  # implicitly it's clear that we use cuda in this case
             print(f"I am local rank {self.local_rank}. {device_count()} GPUs are available. The world size is "
@@ -149,7 +153,7 @@ class nnUNetTrainerStoCoT(object):
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 50
+        self.num_epochs = 1000
         self.current_epoch = 0
         self.enable_deep_supervision = True
 
@@ -416,7 +420,7 @@ class nnUNetTrainerStoCoT(object):
         else:
             loss = DC_and_CE_StoCoT_loss({'batch_dice': self.configuration_manager.batch_dice,
                                    'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
-                                  ignore_label=self.label_manager.ignore_label, dice_class=StoCoTSoftDiceLoss)
+                                  ignore_label=self.label_manager.ignore_label, dice_class=StoCoTSoftDiceLoss, alpha=self.alpha, beta=self.beta)
 
         if self._do_i_compile():
             loss.dc = torch.compile(loss.dc)
@@ -1023,7 +1027,7 @@ class nnUNetTrainerStoCoT(object):
             output1 = self.network1(data)
             output2 = self.network2(data)
             # del data
-            l,l2 = self.loss(output1, output2, target)
+            l,l2 = self.loss(output1, output2, target,len(output1)*[self.optimizer1.param_groups[0]['lr']])
 
         if self.grad_scaler1 is not None:
             self.grad_scaler1.scale(l).backward()
@@ -1064,7 +1068,7 @@ class nnUNetTrainerStoCoT(object):
             loss_here2 = np.mean(outputs['loss2'])
 
         self.logger.log('train_losses1', loss_here, self.current_epoch)
-        self.logger.log('train_losses2', loss_here, self.current_epoch)
+        self.logger.log('train_losses2', loss_here2, self.current_epoch)
 
 
     def on_validation_epoch_start(self):
@@ -1089,7 +1093,7 @@ class nnUNetTrainerStoCoT(object):
             output1 = self.network1(data)
             output2 = self.network2(data)
             del data
-            l, l2 = self.loss(output1, output2, target)
+            l, l2 = self.loss(output1, output2, target,len(output1)*[self.optimizer1.param_groups[0]['lr']])
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:

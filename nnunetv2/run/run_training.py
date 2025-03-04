@@ -35,6 +35,8 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
                           fold: int,
                           trainer_name: str = 'nnUNetTrainer',
                           use_stochastic_coteaching: bool = False,
+                          alpha: float = 32,
+                          beta: float = 2,
                           plans_identifier: str = 'nnUNetPlans',
                           use_compressed: bool = False,
                           device: torch.device = torch.device('cuda')):
@@ -72,6 +74,9 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
     dataset_json = load_json(join(preprocessed_dataset_folder_base, 'dataset.json'))
     nnunet_trainer = nnunet_trainer(plans=plans, configuration=configuration, fold=fold,
                                     dataset_json=dataset_json, unpack_dataset=not use_compressed, device=device)
+    
+    nnunet_trainer.alpha=alpha
+    nnunet_trainer.beta=beta
     return nnunet_trainer
 
 
@@ -145,12 +150,12 @@ def cleanup_ddp():
     dist.destroy_process_group()
 
 
-def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, use_stochastic_coteaching, p, use_compressed, disable_checkpointing, c, val,
+def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, use_stochastic_coteaching, alpha,beta, p, use_compressed, disable_checkpointing, c, val,
             pretrained_weights, npz, val_with_best, world_size):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
-    nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, use_stochastic_coteaching, p,
+    nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, use_stochastic_coteaching,alpha,beta, p,
                                            use_compressed)
 
     if disable_checkpointing:
@@ -180,6 +185,8 @@ def run_training(dataset_name_or_id: Union[str, int],
                  configuration: str, fold: Union[int, str],
                  trainer_class_name: str = 'nnUNetTrainer',
                  use_stochastic_coteaching: bool = False,
+                 alpha: float = 32,
+                 beta: float =2,
                  plans_identifier: str = 'nnUNetPlans',
                  pretrained_weights: Optional[str] = None,
                  num_gpus: int = 1,
@@ -190,6 +197,8 @@ def run_training(dataset_name_or_id: Union[str, int],
                  disable_checkpointing: bool = False,
                  val_with_best: bool = False,
                  device: torch.device = torch.device('cuda')):
+
+    
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
               "INFO: You are using the old nnU-Net default plans. We have updated our recommendations. "
@@ -223,6 +232,8 @@ def run_training(dataset_name_or_id: Union[str, int],
                      fold,
                      trainer_class_name,
                      use_stochastic_coteaching,
+                     alpha,
+                     beta,
                      plans_identifier,
                      use_compressed_data,
                      disable_checkpointing,
@@ -235,9 +246,9 @@ def run_training(dataset_name_or_id: Union[str, int],
                  nprocs=num_gpus,
                  join=True)
     else:
-        nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold,  trainer_class_name, use_stochastic_coteaching,
+        nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold,  trainer_class_name, use_stochastic_coteaching, alpha, beta,
                                                plans_identifier, use_compressed_data, device=device)
-
+        
         if disable_checkpointing:
             nnunet_trainer.disable_checkpointing = disable_checkpointing
 
@@ -272,7 +283,11 @@ def run_training_entry():
     parser.add_argument('-tr', type=str, required=False, default='nnUNetTrainer',
                         help='[OPTIONAL] Use this flag to specify a custom trainer. Default: nnUNetTrainer')
     parser.add_argument('-stocot', type=bool, required=False, default=False,
-                        help='[OPTIONAL] Use this flag to specify if you want to use stochastic co-training to account for noisy labels. This has to be accompanied by -tr nnUNetTrainerStoCoT Default: 0')
+                        help='[OPTIONAL] Use this flag to specify if you want to use stochastic co-teaching to account for noisy labels. This has to be accompanied by -tr nnUNetTrainerStoCoT Default: 0')
+    parser.add_argument('-alpha', type=float, required=False, default=32,
+                        help='[OPTIONAL] alpha parameter of the Beta distribution. Only used for stochastic co-teaching. Default 32')
+    parser.add_argument('-beta', type=float, required=False, default=2,
+                        help='[OPTIONAL] beta parameter of the Beta distribution. Only used for stochastic co-teaching. Default 2')
     parser.add_argument('-p', type=str, required=False, default='nnUNetPlans',
                         help='[OPTIONAL] Use this flag to specify a custom plans identifier. Default: nnUNetPlans')
     parser.add_argument('-pretrained_weights', type=str, required=False, default=None,
@@ -319,7 +334,7 @@ def run_training_entry():
     else:
         device = torch.device('mps')
 
-    run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr,args.stocot, args.p, args.pretrained_weights,
+    run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr,args.stocot,args.alpha,args.beta, args.p, args.pretrained_weights,
                  args.num_gpus, args.use_compressed, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
                  device=device)
 
