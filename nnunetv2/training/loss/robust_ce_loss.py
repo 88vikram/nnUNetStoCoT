@@ -1,7 +1,7 @@
 import torch
 from torch import nn, Tensor
 import numpy as np
-
+import torch.nn.functional as F
 
 class RobustCrossEntropyLoss(nn.CrossEntropyLoss):
     """
@@ -13,8 +13,9 @@ class RobustCrossEntropyLoss(nn.CrossEntropyLoss):
         if target.ndim == input.ndim:
             assert target.shape[1] == 1
             target = target[:, 0]
-        
-        return super().forward(input, target.long())
+        ce_loss = super().forward(input, target.long())
+        print(ce_loss)
+        return ce_loss
     
 
 class StoCoTRobustCrossEntropyLoss(nn.CrossEntropyLoss):
@@ -47,11 +48,14 @@ class StoCoTRobustCrossEntropyLoss(nn.CrossEntropyLoss):
 
         return final_repeated_tensor
 
-    def mask_probabilities(self,x,final_stochastic_thresholds):        
+    def mask_probabilities(self,x,y,final_stochastic_thresholds):        
 
-        mask = torch.ones((1,), dtype=torch.float32, device=x.device).expand(tuple(x.shape))
-        mask = torch.gt(x, final_stochastic_thresholds).type(torch.cuda.FloatTensor)
-        
+        class_dim=1
+        probabilities = F.softmax(x, dim=class_dim)
+        class_probabilities = torch.gather(probabilities,class_dim,y.unsqueeze(class_dim).long())
+        mask = torch.ge(class_probabilities, final_stochastic_thresholds[:,0]).type(torch.cuda.FloatTensor)
+        mask = mask.expand(x.shape)
+
         return mask
 
     def forward(self, input1: Tensor,input2: Tensor, target: Tensor,stochastic_thresholds:Tensor):
@@ -60,9 +64,9 @@ class StoCoTRobustCrossEntropyLoss(nn.CrossEntropyLoss):
             target = target[:, 0]
 
         final_stochastic_thresholds=self.repeat_and_truncate(stochastic_thresholds,input1.shape,1)
-        stocot_mask1 = self.mask_probabilities(input1,final_stochastic_thresholds).to(torch.bool)
-        stocot_mask2 = self.mask_probabilities(input2,final_stochastic_thresholds).to(torch.bool)
-
+        stocot_mask1 = self.mask_probabilities(input1,target,final_stochastic_thresholds).to(torch.bool)
+        stocot_mask2 = self.mask_probabilities(input2,target,final_stochastic_thresholds).to(torch.bool)
+        
         loss_object=nn.CrossEntropyLoss(reduction='none')
 
         if input1.ndim != target.ndim:
@@ -75,12 +79,13 @@ class StoCoTRobustCrossEntropyLoss(nn.CrossEntropyLoss):
             y_onehot = torch.zeros(input1.shape, device=input1.device, dtype=torch.bool)
             y_onehot.scatter_(1, target.long(), 1)
 
-        loss1=loss_object.forward(input1[stocot_mask2], y_onehot[stocot_mask2].float())
-        loss2=loss_object.forward(input2[stocot_mask1], y_onehot[stocot_mask1].float())
+
+        loss1=(loss_object.forward(input1, y_onehot.float()))*stocot_mask2
+        loss2=(loss_object.forward(input2, y_onehot.float()))*stocot_mask1
 
         ce_loss1=loss1.sum() / stocot_mask2.sum()
         ce_loss2=loss2.sum() / stocot_mask1.sum()
-
+        
         return ce_loss1,ce_loss2
 
 

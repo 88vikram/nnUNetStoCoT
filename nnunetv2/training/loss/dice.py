@@ -4,6 +4,7 @@ import torch
 from nnunetv2.utilities.ddp_allgather import AllGatherGrad
 from torch import nn
 import numpy as np 
+import torch.nn.functional as F
 
 
 class SoftDiceLoss(nn.Module):
@@ -92,11 +93,14 @@ class StoCoTSoftDiceLoss(nn.Module):
 
         return final_repeated_tensor
 
-    def mask_probabilities(self,x,final_stochastic_thresholds):        
+    def mask_probabilities(self,x,y,final_stochastic_thresholds):        
 
-        mask = torch.ones((1,), dtype=torch.float32, device=x.device).expand(tuple(x.shape))
-        mask = torch.gt(x, final_stochastic_thresholds).type(torch.cuda.FloatTensor)
-        
+        class_dim=1
+        probabilities = F.softmax(x, dim=class_dim)
+        class_probabilities = torch.gather(probabilities,class_dim,y.long())
+        mask = torch.ge(class_probabilities, final_stochastic_thresholds[:,0]).type(torch.cuda.FloatTensor)
+        mask = mask.expand(x.shape)
+
         return mask
         # generate thresholds based on beta pdf.
 
@@ -112,15 +116,17 @@ class StoCoTSoftDiceLoss(nn.Module):
             x2 = self.apply_nonlin(x2)
 
         final_stochastic_thresholds=self.repeat_and_truncate(stochastic_thresholds,x1.shape,1)
-        stocot_mask1 = self.mask_probabilities(x1,final_stochastic_thresholds)
-        stocot_mask2 = self.mask_probabilities(x2,final_stochastic_thresholds)
+        stocot_mask1 = self.mask_probabilities(x1,y,final_stochastic_thresholds)
+        stocot_mask2 = self.mask_probabilities(x2,y,final_stochastic_thresholds)
 
         fraction_reject_1 = (1. - (stocot_mask1.sum() / torch.prod(torch.tensor(stocot_mask1.shape)))).item()
         fraction_reject_2 = (1. - (stocot_mask2.sum() / torch.prod(torch.tensor(stocot_mask2.shape)))).item()
-        #print('Rejection rates', fraction_reject_1, fraction_reject_2, x1.shape)
+
+#        if fraction_reject_1>0:
+#            print('Rejection rates', fraction_reject_1, fraction_reject_2, x1.shape)
 
         if loss_mask is not None:
-            print('Current implementation ignores the variable loss_mask. Please rectify this before using this further')
+            raise ValueError('Current implementation ignores the variable loss_mask. Please rectify this before using the code further')
             
         tp, fp, fn, _ = stocot_get_tp_fp_fn_tn(x1, y, axes, stocot_mask2, False)
         tp2, fp2, fn2, _ = stocot_get_tp_fp_fn_tn(x2, y, axes, stocot_mask1, False)
@@ -157,7 +163,6 @@ class StoCoTSoftDiceLoss(nn.Module):
         
         dc = dc.mean()
         dc2 = dc2.mean()
-
         return -dc, -dc2
 
 

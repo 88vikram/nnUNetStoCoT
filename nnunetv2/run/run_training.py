@@ -72,11 +72,13 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
     plans_file = join(preprocessed_dataset_folder_base, plans_identifier + '.json')
     plans = load_json(plans_file)
     dataset_json = load_json(join(preprocessed_dataset_folder_base, 'dataset.json'))
-    nnunet_trainer = nnunet_trainer(plans=plans, configuration=configuration, fold=fold,
+    if use_stochastic_coteaching==False:
+        nnunet_trainer = nnunet_trainer(plans=plans, configuration=configuration, fold=fold,
                                     dataset_json=dataset_json, unpack_dataset=not use_compressed, device=device)
+    else:
+        nnunet_trainer = nnunet_trainer(plans=plans, configuration=configuration, fold=fold,
+                                    dataset_json=dataset_json, unpack_dataset=not use_compressed, device=device, alpha = alpha, beta=beta)
     
-    nnunet_trainer.alpha=alpha
-    nnunet_trainer.beta=beta
     return nnunet_trainer
 
 

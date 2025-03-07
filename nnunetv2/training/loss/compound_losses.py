@@ -53,7 +53,6 @@ class DC_and_CE_loss(nn.Module):
         
         ce_loss = self.ce(net_output, target[:, 0]) \
             if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
-
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
         
         return result
@@ -85,7 +84,7 @@ class DC_and_CE_StoCoT_loss(nn.Module):
 
 
 
-    def generate_stochastic_thresholds(self,x,alpha,beta,learning_rate):
+    def generate_stochastic_thresholds(self,x,alpha,beta,coteaching_schedule):
 
         samples=x.shape[0]
         if len(x.shape)==4:
@@ -93,14 +92,15 @@ class DC_and_CE_StoCoT_loss(nn.Module):
         elif len(x.shape)==5:
             dist_shape = (samples,8,16,16)
         
-        if learning_rate != 0:
+        stochastic_thresholds = torch.zeros((1,), dtype=torch.float32, device=x.device).expand(tuple(dist_shape))
+        if coteaching_schedule != 0:
             stochastic_thresholds = torch.from_numpy(
-                learning_rate * self.rng.beta(a=alpha, b=beta, size=dist_shape).astype(np.float32)).cuda()
+                coteaching_schedule * self.rng.beta(a=alpha, b=beta, size=dist_shape).astype(np.float32)).cuda()
         
         return stochastic_thresholds
         # generate thresholds based on beta pdf.
 
-    def forward(self, net_output1: torch.Tensor,net_output2: torch.Tensor, target: torch.Tensor, learning_rate: float):
+    def forward(self, net_output1: torch.Tensor,net_output2: torch.Tensor, target: torch.Tensor, current_epoch: float):
         """
         target must be b, c, x, y(, z) with c=1
         :param net_output:
@@ -119,7 +119,16 @@ class DC_and_CE_StoCoT_loss(nn.Module):
             target_dice = target
             mask = None
 
-        stochastic_thresholds = self.generate_stochastic_thresholds(net_output1,self.alpha,self.beta,learning_rate)
+        n_coteach_start = 5
+        if current_epoch<n_coteach_start:
+            #no stochastic co-teaching
+            coteaching_schedule=0
+        elif current_epoch<(2*n_coteach_start):
+            overall_schedule=np.linspace(0, 1, n_coteach_start+1)
+            coteaching_schedule=overall_schedule[current_epoch-n_coteach_start]
+        else:
+            coteaching_schedule=1
+        stochastic_thresholds = self.generate_stochastic_thresholds(net_output1,self.alpha,self.beta,coteaching_schedule)
 
         if self.weight_dice != 0:
             dc_loss1, dc_loss2 = self.dc(net_output1, net_output2, target_dice,stochastic_thresholds,loss_mask=mask)
@@ -138,7 +147,6 @@ class DC_and_CE_StoCoT_loss(nn.Module):
         
         #ce_loss2 = self.ce(net_output2, target[:, 0]) \
         #    if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
-
         result1 = self.weight_ce * ce_loss1 + self.weight_dice * dc_loss1
         result2 = self.weight_ce * ce_loss2 + self.weight_dice * dc_loss2
         

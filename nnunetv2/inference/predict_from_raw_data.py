@@ -89,7 +89,7 @@ class nnUNetPredictor(object):
                 inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
 
-            parameters.append(checkpoint['network_weights'])
+            parameters.append(checkpoint['network1_weights'])
 
         configuration_manager = plans_manager.get_configuration(configuration_name)
         # restore network

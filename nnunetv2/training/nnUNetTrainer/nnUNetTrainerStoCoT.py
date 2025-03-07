@@ -71,7 +71,7 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 class nnUNetTrainerStoCoT(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device('cuda')):
+                 device: torch.device = torch.device('cuda'), alpha: float = 33, beta: float = 2.1):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
 
         # apex predator of grug is complexity
@@ -91,12 +91,9 @@ class nnUNetTrainerStoCoT(object):
 
         self.is_ddp = dist.is_available() and dist.is_initialized()
         self.local_rank = 0 if not self.is_ddp else dist.get_rank()
-
         self.device = device
-
-        # parameters of the beta distribution
-        self.alpha=32 # default values
-        self.beta=2
+        self.alpha=alpha
+        self.beta=beta
 
         # print what device we are using
         if self.is_ddp:  # implicitly it's clear that we use cuda in this case
@@ -130,7 +127,7 @@ class nnUNetTrainerStoCoT(object):
         self.preprocessed_dataset_folder_base = join(nnUNet_preprocessed, self.plans_manager.dataset_name) \
             if nnUNet_preprocessed is not None else None
         self.output_folder_base = join(nnUNet_results, self.plans_manager.dataset_name,
-                                       self.__class__.__name__ + '__' + self.plans_manager.plans_name + "__" + configuration) \
+                                       self.__class__.__name__ + '__' + self.plans_manager.plans_name + "__" + configuration+"__"+f"{self.alpha:.1f}"+'_'+f"{self.beta:.1f}") \
             if nnUNet_results is not None else None
         self.output_folder = join(self.output_folder_base, f'fold_{fold}')
 
@@ -153,7 +150,7 @@ class nnUNetTrainerStoCoT(object):
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 500
         self.current_epoch = 0
         self.enable_deep_supervision = True
 
@@ -1027,8 +1024,7 @@ class nnUNetTrainerStoCoT(object):
             output1 = self.network1(data)
             output2 = self.network2(data)
             # del data
-            l,l2 = self.loss(output1, output2, target,len(output1)*[self.optimizer1.param_groups[0]['lr']])
-
+            l,l2 = self.loss(output1, output2, target,len(output1)*[self.current_epoch])
         if self.grad_scaler1 is not None:
             self.grad_scaler1.scale(l).backward()
             self.grad_scaler1.unscale_(self.optimizer1)
@@ -1066,7 +1062,6 @@ class nnUNetTrainerStoCoT(object):
         else:
             loss_here = np.mean(outputs['loss1'])
             loss_here2 = np.mean(outputs['loss2'])
-
         self.logger.log('train_losses1', loss_here, self.current_epoch)
         self.logger.log('train_losses2', loss_here2, self.current_epoch)
 
@@ -1093,7 +1088,7 @@ class nnUNetTrainerStoCoT(object):
             output1 = self.network1(data)
             output2 = self.network2(data)
             del data
-            l, l2 = self.loss(output1, output2, target,len(output1)*[self.optimizer1.param_groups[0]['lr']])
+            l, l2 = self.loss(output1, output2, target,len(output1)*[self.current_epoch])
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
