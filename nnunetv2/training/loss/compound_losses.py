@@ -119,7 +119,7 @@ class DC_and_CE_StoCoT_loss(nn.Module):
             target_dice = target
             mask = None
 
-        n_coteach_start = 5
+        n_coteach_start = 20
         if current_epoch<n_coteach_start:
             #no stochastic co-teaching
             coteaching_schedule=0
