@@ -96,8 +96,7 @@ class StoCoTSoftDiceLoss(nn.Module):
     def mask_probabilities(self,x,y,final_stochastic_thresholds):        
 
         class_dim=1
-        probabilities = F.softmax(x, dim=class_dim)
-        class_probabilities = torch.gather(probabilities,class_dim,y.long())
+        class_probabilities = torch.gather(x,class_dim,y.long())
         mask = torch.ge(class_probabilities, final_stochastic_thresholds[:,0]).type(torch.cuda.FloatTensor)
         mask = mask.expand(x.shape)
 
@@ -122,8 +121,8 @@ class StoCoTSoftDiceLoss(nn.Module):
         fraction_reject_1 = (1. - (stocot_mask1.sum() / torch.prod(torch.tensor(stocot_mask1.shape)))).item()
         fraction_reject_2 = (1. - (stocot_mask2.sum() / torch.prod(torch.tensor(stocot_mask2.shape)))).item()
 
-#        if fraction_reject_1>0:
-#            print('Rejection rates', fraction_reject_1, fraction_reject_2, x1.shape)
+        #if fraction_reject_1>0:
+        #    print('Rejection rates', fraction_reject_1, fraction_reject_2, x1.shape)
 
         if loss_mask is not None:
             raise ValueError('Current implementation ignores the variable loss_mask. Please rectify this before using the code further')
