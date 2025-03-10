@@ -97,7 +97,9 @@ class StoCoTSoftDiceLoss(nn.Module):
 
         class_dim=1
         class_probabilities = torch.gather(x,class_dim,y.long())
-        mask = torch.ge(class_probabilities, final_stochastic_thresholds[:,0]).type(torch.cuda.FloatTensor)
+        final_stochastic_thresholds=final_stochastic_thresholds[:,0].type(torch.cuda.FloatTensor)
+        final_stochastic_thresholds = final_stochastic_thresholds.unsqueeze(class_dim)
+        mask = torch.ge(class_probabilities, final_stochastic_thresholds)
         mask = mask.expand(x.shape)
 
         return mask

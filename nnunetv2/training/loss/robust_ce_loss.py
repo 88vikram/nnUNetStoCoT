@@ -52,8 +52,9 @@ class StoCoTRobustCrossEntropyLoss(nn.CrossEntropyLoss):
 
         class_dim=1
         class_probabilities = torch.gather(x,class_dim,y.unsqueeze(class_dim).long())
-        mask = torch.ge(class_probabilities, final_stochastic_thresholds[:,0]).type(torch.cuda.FloatTensor)
-        mask = mask.expand(x.shape)
+        final_stochastic_thresholds=final_stochastic_thresholds[:,0].type(torch.cuda.FloatTensor)
+        final_stochastic_thresholds = final_stochastic_thresholds.unsqueeze(class_dim)
+        mask = torch.ge(class_probabilities, final_stochastic_thresholds)
 
         return mask
 
